@@ -10,6 +10,11 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&display=swap" rel="stylesheet">
+<!--
+  ⚠️ OneSignal Web Push — يشتغل فقط لما تستضيف هذا الملف على نطاقك الخاص (GitHub Pages مثلاً)،
+  وبعد ما تضيف ملفات الـ Service Worker بجذر النطاق — شوف التعليمات بآخر الملف.
+-->
+<script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
 <style>
   :root{
     --forest:#3D5140;
@@ -344,6 +349,36 @@
 <script>
 /* ================= CONFIG ================= */
 const FIREBASE_URL = "https://al-sanyah-muswake-default-rtdb.firebaseio.com";
+// لو ما ضفت حقل "oneSignalAppId" تحت /config بـ Firebase (جنب oneSignalApiKey)، اكتبه هنا كبديل:
+const ONESIGNAL_APP_ID_FALLBACK = "ca3e4098-aa5f-438f-82b8-31818ea7311d";
+const ONESIGNAL_SAFARI_WEB_ID = "web.onesignal.auto.39e347a3-7290-467c-af89-3542a6fc2365";
+const ONESIGNAL_DRIVERS_SEGMENT = "Drivers";
+
+/* ---- OneSignal Web Push (يشتغل بعد استضافة الملف على نطاقك الخاص + رفع ملفات الـ Service Worker) ---- */
+let oneSignalWebReady = false;
+window.OneSignalDeferred = window.OneSignalDeferred || [];
+window.OneSignalDeferred.push(async function(OneSignal){
+  try{
+    const appId = ONESIGNAL_APP_ID_FALLBACK || (state.appConfig && state.appConfig.oneSignalAppId) || '';
+    if(!appId){ console.warn('OneSignal App ID غير مضبوط بعد'); return; }
+    await OneSignal.init({ appId, safari_web_id: ONESIGNAL_SAFARI_WEB_ID, notifyButton: { enable: true } });
+    oneSignalWebReady = true;
+    // لو الزبون سبق سجّل دخوله بهذا المتصفح، اربطه بالـ external_id (الإيميل) من جديد
+    if(state.user && state.user.email){
+      try{ await OneSignal.login(state.user.email); }catch(e){ console.warn('OneSignal login failed', e); }
+    }
+  }catch(e){ console.error('OneSignal web init failed', e); }
+});
+
+/** يطلب إذن الإشعارات من المتصفح ويربط الزبون بـ external_id (الإيميل) — ينادى بعد تسجيل دخول Google */
+async function enableWebPushForCurrentUser(){
+  window.OneSignalDeferred.push(async function(OneSignal){
+    try{
+      if(state.user && state.user.email){ await OneSignal.login(state.user.email); }
+      await OneSignal.Notifications.requestPermission();
+    }catch(e){ console.warn('تعذر طلب إذن الإشعارات', e); }
+  });
+}
 
 /* ================= STATE ================= */
 let state = {
@@ -400,12 +435,44 @@ async function loadConfiguration(){
       state.appConfig = {
         appStatus: c.appStatus || 'open',
         deliveryFee: c.deliveryFee || 1500,
-        lastOrderNum: c.lastOrderNum || 1
+        lastOrderNum: c.lastOrderNum || 1,
+        oneSignalApiKey: c.oneSignalApiKey || '',
+        oneSignalAppId: c.oneSignalAppId || ONESIGNAL_APP_ID_FALLBACK
       };
     }
   }catch(e){ console.warn('config load failed', e); }
   renderShopStatus();
   renderFoodStatus();
+}
+
+/** يرسل إشعار OneSignal لكل الدلفريات (Segment "Drivers")، نفس آلية نسخة الأندرويد */
+async function notifyDriversViaOneSignal(title, body){
+  const apiKey = state.appConfig.oneSignalApiKey;
+  const appId = state.appConfig.oneSignalAppId;
+  if(!apiKey || !appId){
+    console.warn('OneSignal غير مضبوط (App ID أو API Key مفقود)، تم تخطي الإشعار');
+    return;
+  }
+  try{
+    await fetch('https://api.onesignal.com/notifications', {
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json; charset=utf-8',
+        'Authorization': 'Key ' + apiKey
+      },
+      body: JSON.stringify({
+        app_id: appId,
+        target_channel: 'push',
+        included_segments: [ONESIGNAL_DRIVERS_SEGMENT],
+        headings: { en:title, ar:title },
+        contents: { en:body, ar:body },
+        priority: 10,
+        ttl: 600
+      })
+    });
+  }catch(e){
+    console.error('OneSignal notify failed', e);
+  }
 }
 
 /* ================= LOGIN ================= */
@@ -430,6 +497,7 @@ document.getElementById('google-login-btn').addEventListener('click', async () =
     state.user = { name: user.displayName || 'زبون تسوكلي', phone: '', email: user.email || '' };
     localStorage.setItem('tsookly_user', JSON.stringify(state.user));
     enterApp();
+    enableWebPushForCurrentUser();
   }catch(e){
     console.error('google sign-in failed', e);
     const code = (e && e.code) ? e.code : 'غير معروف';
@@ -629,7 +697,7 @@ async function submitShopOrder(){
       date: iraqDate(),
       deliveryFee: state.appConfig.deliveryFee,
       orderType: 'shopping',
-      clientId: state.user.phone || state.user.name,
+      clientId: state.user.email || state.user.phone || state.user.name,
       taken:false, cancelled:false, delivered:false,
       createdAt: Date.now()
     };
@@ -637,6 +705,7 @@ async function submitShopOrder(){
     await fbPost('driverOrders', order);
     await fbPut('config/lastOrderNum', orderId + 1);
     state.appConfig.lastOrderNum = orderId + 1;
+    notifyDriversViaOneSignal(`📦 طلب جديد #${orderId}`, `${name} — اضغط للاستلام قبل غيرك`);
 
     state.shop.uiState = 'success';
     state.shop.orderId = orderId;
@@ -850,7 +919,7 @@ async function submitFoodOrder(){
       deliveryFee: state.food.deliveryFee,
       orderType: 'food',
       itemsTotal, totalPrice: grandTotal,
-      clientId: state.user.phone || state.user.name,
+      clientId: state.user.email || state.user.phone || state.user.name,
       taken:false, cancelled:false, delivered:false,
       createdAt: Date.now()
     };
@@ -858,6 +927,7 @@ async function submitFoodOrder(){
     await fbPost('driverOrders', order);
     await fbPut('config/lastOrderNum', orderId + 1);
     state.appConfig.lastOrderNum = orderId + 1;
+    notifyDriversViaOneSignal(`📦 طلب جديد #${orderId}`, `${name} — اضغط للاستلام قبل غيرك`);
 
     state.food.uiState = 'success';
     state.food.orderId = orderId;
@@ -914,7 +984,7 @@ setTimeout(()=>{
 
   const saved = localStorage.getItem('tsookly_user');
   if(saved){
-    try{ state.user = JSON.parse(saved); enterApp(); }catch(e){}
+    try{ state.user = JSON.parse(saved); enterApp(); enableWebPushForCurrentUser(); }catch(e){}
   }
 })();
 </script>
