@@ -576,7 +576,7 @@ document.getElementById('refresh-btn').addEventListener('click', ()=>{
 function renderShopStatus(){
   const open = (state.appConfig.appStatus||'open').toLowerCase() !== 'close';
   document.getElementById('status-dot').classList.toggle('closed', !open);
-  document.getElementById('status-text').textContent = open ? 'مفتوح للطلب السريع' : 'مغلق مؤقتاً';
+  document.getElementById('status-text').textContent = open ? 'مفتوح للطلب السريع.' : 'مغلق مؤقتاً';
 
   const b = document.getElementById('shop-status-banner');
   b.className = 'banner ' + (open ? 'ok' : 'warn');
