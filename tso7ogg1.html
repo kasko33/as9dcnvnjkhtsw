@@ -427,6 +427,26 @@ async function fbPut(path, body){
   });
   return res.ok;
 }
+async function fbPatch(path, body){
+  const res = await fetch(`${cleanUrl(FIREBASE_URL)}/${path}.json`, {
+    method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+  });
+  return res.ok;
+}
+
+/** يحفظ/يحدّث بيانات المستخدم المسجّل دخول تحت /users/<uid> بنفس قاعدة بيانات الطلبات */
+async function saveUserToDatabase(uid, data){
+  if(!uid) return;
+  try{
+    const existing = await fbGet(`users/${uid}`);
+    const now = iraqDate();
+    if(existing){
+      await fbPatch(`users/${uid}`, { name: data.name, email: data.email, lastLogin: now });
+    } else {
+      await fbPut(`users/${uid}`, { name: data.name, email: data.email, phone:'', createdAt: now, lastLogin: now });
+    }
+  }catch(e){ console.warn('saveUserToDatabase failed', e); }
+}
 
 async function loadConfiguration(){
   try{
@@ -445,16 +465,14 @@ async function loadConfiguration(){
   renderFoodStatus();
 }
 
-/** يرسل إشعار OneSignal لكل الدلفريات (Segment "Drivers")، نفس آلية نسخة الأندرويد */
+/** يرسل إشعار OneSignal لكل الدلفريات (Segment "Drivers")، نفس آلية نسخة الأندرويد. يرجع نتيجة واضحة للتشخيص */
 async function notifyDriversViaOneSignal(title, body){
   const apiKey = state.appConfig.oneSignalApiKey;
   const appId = state.appConfig.oneSignalAppId;
-  if(!apiKey || !appId){
-    console.warn('OneSignal غير مضبوط (App ID أو API Key مفقود)، تم تخطي الإشعار');
-    return;
-  }
+  if(!apiKey) return { ok:false, reason:'لم يتم العثور على oneSignalApiKey تحت /config بـ Firebase.' };
+  if(!appId) return { ok:false, reason:'لم يتم العثور على App ID (لا بالكود ولا بـ Firebase).' };
   try{
-    await fetch('https://api.onesignal.com/notifications', {
+    const res = await fetch('https://api.onesignal.com/notifications', {
       method:'POST',
       headers:{
         'Content-Type':'application/json; charset=utf-8',
@@ -470,8 +488,15 @@ async function notifyDriversViaOneSignal(title, body){
         ttl: 600
       })
     });
+    const text = await res.text().catch(()=> '');
+    if(!res.ok){
+      console.error('OneSignal notify failed', res.status, text);
+      return { ok:false, reason: `خطأ ${res.status}: ${text.slice(0,200)}` };
+    }
+    return { ok:true, reason: text.slice(0,200) };
   }catch(e){
-    console.error('OneSignal notify failed', e);
+    console.error('OneSignal notify failed (network/CORS)', e);
+    return { ok:false, reason: 'خطأ شبكة/CORS: ' + (e && e.message ? e.message : e) };
   }
 }
 
@@ -494,10 +519,11 @@ document.getElementById('google-login-btn').addEventListener('click', async () =
   label.textContent = 'جارِ الدخول...';
   try{
     const user = await window.__tsooklyAuth.signIn();
-    state.user = { name: user.displayName || 'زبون تسوكلي', phone: '', email: user.email || '' };
+    state.user = { name: user.displayName || 'زبون تسوكلي', phone: '', email: user.email || '', uid: user.uid || '' };
     localStorage.setItem('tsookly_user', JSON.stringify(state.user));
     enterApp();
     enableWebPushForCurrentUser();
+    saveUserToDatabase(state.user.uid, { name: state.user.name, email: state.user.email });
   }catch(e){
     console.error('google sign-in failed', e);
     const code = (e && e.code) ? e.code : 'غير معروف';
@@ -642,7 +668,7 @@ function renderShopInvoice(){
   `;
 }
 
-function updateShopFeedback(){
+function updateShopFeedback(debugLine){
   const el = document.getElementById('shop-feedback');
   if(state.shop.uiState === 'submitting'){
     el.innerHTML = `<div class="card" style="display:flex; align-items:center; gap:10px;"><div class="spinner" style="margin:0;"></div><span style="font-size:12.5px; color:var(--ink-soft)">جاري معالجة الطلب وإشعار الإدارة...</span></div>`;
@@ -650,7 +676,8 @@ function updateShopFeedback(){
     el.innerHTML = `<div class="banner ok">
       <div><b>تم إرسال طلبك! رقمه (#${state.shop.orderId})</b>
       <span>سيصلك الدلفري قريباً لباب بيتك! أبقِ هاتفك مفتوحاً.</span></div>
-    </div>`;
+    </div>
+    ${state.shop.oneSignalDebug ? `<div style="font-size:11px; color:var(--ink-soft); margin-top:6px; padding:0 4px;">🔔 حالة الإشعار: ${escapeHtml(state.shop.oneSignalDebug)}</div>` : ''}`;
   } else if(state.shop.uiState === 'error'){
     el.innerHTML = `<div class="banner warn">
       <div><b>تعذر إرسال الطلب!</b><span>${escapeHtml(state.shop.errorMsg)}</span></div>
@@ -705,7 +732,8 @@ async function submitShopOrder(){
     await fbPost('driverOrders', order);
     await fbPut('config/lastOrderNum', orderId + 1);
     state.appConfig.lastOrderNum = orderId + 1;
-    notifyDriversViaOneSignal(`📦 طلب جديد #${orderId}`, `${name} — اضغط للاستلام قبل غيرك`);
+    const pushResult = await notifyDriversViaOneSignal(`📦 طلب جديد #${orderId}`, `${name} — اضغط للاستلام قبل غيرك`);
+    state.shop.oneSignalDebug = pushResult.ok ? '✅ انرسل الإشعار بنجاح' : ('❌ ' + pushResult.reason);
 
     state.shop.uiState = 'success';
     state.shop.orderId = orderId;
@@ -854,7 +882,8 @@ function updateFoodFeedback(){
     el.innerHTML = `<div class="banner ok">
       <div><b>تم إرسال طلبك! رقمه (#${state.food.orderId})</b>
       <span>سيصلك الدلفري قريباً لباب بيتك! أبقِ هاتفك مفتوحاً.</span></div>
-    </div>`;
+    </div>
+    ${state.food.oneSignalDebug ? `<div style="font-size:11px; color:var(--ink-soft); margin-top:6px; padding:0 4px;">🔔 حالة الإشعار: ${escapeHtml(state.food.oneSignalDebug)}</div>` : ''}`;
   } else if(state.food.uiState === 'error'){
     el.innerHTML = `<div class="banner warn">
       <div><b>تعذر إرسال الطلب!</b><span>${escapeHtml(state.food.errorMsg)}</span></div>
@@ -927,7 +956,8 @@ async function submitFoodOrder(){
     await fbPost('driverOrders', order);
     await fbPut('config/lastOrderNum', orderId + 1);
     state.appConfig.lastOrderNum = orderId + 1;
-    notifyDriversViaOneSignal(`📦 طلب جديد #${orderId}`, `${name} — اضغط للاستلام قبل غيرك`);
+    const pushResult = await notifyDriversViaOneSignal(`📦 طلب جديد #${orderId}`, `${name} — اضغط للاستلام قبل غيرك`);
+    state.food.oneSignalDebug = pushResult.ok ? '✅ انرسل الإشعار بنجاح' : ('❌ ' + pushResult.reason);
 
     state.food.uiState = 'success';
     state.food.orderId = orderId;
@@ -984,7 +1014,12 @@ setTimeout(()=>{
 
   const saved = localStorage.getItem('tsookly_user');
   if(saved){
-    try{ state.user = JSON.parse(saved); enterApp(); enableWebPushForCurrentUser(); }catch(e){}
+    try{
+      state.user = JSON.parse(saved);
+      enterApp();
+      enableWebPushForCurrentUser();
+      if(state.user.uid) saveUserToDatabase(state.user.uid, { name: state.user.name, email: state.user.email });
+    }catch(e){}
   }
 })();
 </script>
